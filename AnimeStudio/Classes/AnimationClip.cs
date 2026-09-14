@@ -1629,7 +1629,8 @@ namespace AnimeStudio
             m_CycleOffset = reader.ReadSingle();
             m_AverageAngularSpeed = reader.ReadSingle();
 
-            if ((reader.Game.Type.IsSR() && HasShortIndexArray(reader.serializedType)) || reader.Game.Type.IsZZZ())
+            // if ((reader.Game.Type.IsSR() && HasShortIndexArray(reader.serializedType)) || reader.Game.Type.IsZZZ())
+            if (reader.Game.Type.IsSR() || reader.Game.Type.IsZZZ())
             {
                 m_IndexArray = reader.ReadInt16Array().Select(x => (int)x).ToArray();
             }
