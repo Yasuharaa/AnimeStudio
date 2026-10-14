@@ -219,6 +219,25 @@
         "bug",
         "code"
       ]
+    },
+    {
+      "login": "Koko-boya",
+      "name": "Koks",
+      "avatar_url": "https://avatars.githubusercontent.com/u/53186299?v=4",
+      "profile": "https://github.com/Koko-boya",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "xiaoding521234",
+      "name": "xiaoding521234",
+      "avatar_url": "https://avatars.githubusercontent.com/u/167662303?v=4",
+      "profile": "https://github.com/xiaoding521234",
+      "contributions": [
+        "code",
+        "bug"
+      ]
     }
   ],
   "contributorsPerLine": 7,
