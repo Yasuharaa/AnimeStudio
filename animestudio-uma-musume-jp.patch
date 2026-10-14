@@ -1,0 +1,944 @@
+From e7324a95f6e779583e64a6c7dda9721a2f9ced99 Mon Sep 17 00:00:00 2001
+From: BeritaTeyvat <ariefndhika@gmail.com>
+Date: Wed, 14 Oct 2026 15:29:13 +0700
+Subject: [PATCH] Add Uma Musume (JP) bundle decryption
+
+- New game entry "Uma Musume (JP)".
+- Reads the encrypted meta database through SQLite3 Multiple Ciphers
+  (ChaCha20) to map hash-named dat files to names, dependencies and
+  per-file keys.
+- Decrypts bundles in PreProcessing (XOR from offset 256), unencrypted
+  or unlisted files pass through unchanged.
+- Keys are read from UmaKeys.json so they can change without a rebuild.
+- GUI: File > Load Uma Musume asset... loads assets by name prefix
+  together with all of their dependencies.
+
+Encryption scheme and keys as implemented by UmaViewer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TMR8kHoGWnhCk26s7LBF8o
+---
+ AnimeStudio.GUI/MainForm.UmaMusume.cs | 150 ++++++++++++++++
+ AnimeStudio.GUI/MainForm.cs           |   1 +
+ AnimeStudio/AnimeStudio.csproj        |   5 +
+ AnimeStudio/FileReader.cs             |   3 +
+ AnimeStudio/GameManager.cs            |   3 +
+ AnimeStudio/ImportHelper.cs           |  36 ++++
+ AnimeStudio/UmaMusume/README.md       |  33 ++++
+ AnimeStudio/UmaMusume/UmaCrypto.cs    |  68 +++++++
+ AnimeStudio/UmaMusume/UmaKeys.cs      | 103 +++++++++++
+ AnimeStudio/UmaMusume/UmaMeta.cs      | 245 ++++++++++++++++++++++++++
+ AnimeStudio/UmaMusume/UmaSqlite3MC.cs | 151 ++++++++++++++++
+ 11 files changed, 798 insertions(+)
+ create mode 100644 AnimeStudio.GUI/MainForm.UmaMusume.cs
+ create mode 100644 AnimeStudio/UmaMusume/README.md
+ create mode 100644 AnimeStudio/UmaMusume/UmaCrypto.cs
+ create mode 100644 AnimeStudio/UmaMusume/UmaKeys.cs
+ create mode 100644 AnimeStudio/UmaMusume/UmaMeta.cs
+ create mode 100644 AnimeStudio/UmaMusume/UmaSqlite3MC.cs
+
+diff --git a/AnimeStudio.GUI/MainForm.UmaMusume.cs b/AnimeStudio.GUI/MainForm.UmaMusume.cs
+new file mode 100644
+index 0000000..1e68457
+--- /dev/null
++++ b/AnimeStudio.GUI/MainForm.UmaMusume.cs
+@@ -0,0 +1,150 @@
++using System;
++using System.Collections.Generic;
++using System.Drawing;
++using System.IO;
++using System.Linq;
++using System.Threading.Tasks;
++using System.Windows.Forms;
++
++namespace AnimeStudio.GUI
++{
++    /// <summary>
++    /// Uma Musume (JP): load assets by their meta name (e.g. "3d/chara/body/bdy1001_00") together with
++    /// every dependency listed in the meta database, instead of picking hash-named files from dat/.
++    /// </summary>
++    partial class MainForm
++    {
++        private string umaGameFolder;
++        private string umaLastQuery = "3d/chara/body/bdy1001_00";
++
++        private void InitializeUmaMusume()
++        {
++            var item = new ToolStripMenuItem("Load Uma Musume asset...");
++            item.Click += loadUmaMusumeAsset_Click;
++            int index = fileToolStripMenuItem.DropDownItems.IndexOf(loadFolderToolStripMenuItem);
++            fileToolStripMenuItem.DropDownItems.Insert(index + 1, item);
++        }
++
++        private async void loadUmaMusumeAsset_Click(object sender, EventArgs e)
++        {
++            if (Studio.Game == null || !Studio.Game.Type.IsUmaMusume())
++            {
++                MessageBox.Show(this, "Select \"Uma Musume (JP)\" in the game selector first.", "Uma Musume", MessageBoxButtons.OK, MessageBoxIcon.Information);
++                return;
++            }
++
++            var root = UmaPickGameFolder();
++            if (root == null)
++            {
++                return;
++            }
++
++            var input = UmaPrompt(umaLastQuery);
++            if (string.IsNullOrWhiteSpace(input))
++            {
++                return;
++            }
++            umaLastQuery = input.Trim();
++
++            try
++            {
++                var paths = new List<string>();
++                var missing = new List<string>();
++                var query = umaLastQuery;
++                StatusStripUpdate("Reading Uma Musume meta...");
++                // The first call reads the whole meta database, keep it off the UI thread.
++                await Task.Run(() =>
++                {
++                    foreach (var prefix in query.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
++                    {
++                        paths.AddRange(UmaMeta.ResolveFiles(root, prefix, out var missingForPrefix));
++                        missing.AddRange(missingForPrefix);
++                    }
++                });
++                paths = paths.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
++                missing = missing.Distinct().ToList();
++                if (missing.Count > 0)
++                {
++                    Logger.Warning($"[UmaMusume] {missing.Count} entries are not downloaded and were skipped: {string.Join(", ", missing.Take(20))}{(missing.Count > 20 ? ", ..." : string.Empty)}");
++                }
++                if (paths.Count == 0)
++                {
++                    MessageBox.Show(this, $"No downloaded asset in meta starts with:\n{umaLastQuery}", "Uma Musume", MessageBoxButtons.OK, MessageBoxIcon.Warning);
++                    return;
++                }
++
++                Logger.Info($"[UmaMusume] Loading {paths.Count} files for \"{umaLastQuery}\" (assets + dependencies).");
++                openDirectoryBackup = Path.Combine(root, "dat");
++                LoadPaths(null, paths.ToArray());
++            }
++            catch (Exception ex)
++            {
++                Logger.Error("[UmaMusume] Failed to resolve assets", ex);
++                MessageBox.Show(this, ex.Message, "Uma Musume", MessageBoxButtons.OK, MessageBoxIcon.Error);
++            }
++        }
++
++        /// <summary> The folder holding "meta" and "dat". Asks once, defaulting to the DMM install location. </summary>
++        private string UmaPickGameFolder()
++        {
++            if (umaGameFolder != null && UmaMeta.FindRoot(umaGameFolder) == umaGameFolder)
++            {
++                return umaGameFolder;
++            }
++
++            var guess = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + "Low", "Cygames", "umamusume");
++            var dialog = new OpenFolderDialog
++            {
++                Title = "Select the Uma Musume data folder (contains \"meta\" and \"dat\")",
++                InitialFolder = Directory.Exists(guess) ? guess : openDirectoryBackup,
++            };
++            if (dialog.ShowDialog(this) != DialogResult.OK)
++            {
++                return null;
++            }
++
++            var root = UmaMeta.FindRoot(dialog.Folder);
++            if (root == null)
++            {
++                MessageBox.Show(this, "That folder (or its parents) has no \"meta\" file next to a \"dat\" folder.", "Uma Musume", MessageBoxButtons.OK, MessageBoxIcon.Warning);
++                return null;
++            }
++
++            umaGameFolder = root;
++            return root;
++        }
++
++        private string UmaPrompt(string initial)
++        {
++            using var form = new Form
++            {
++                Text = "Load Uma Musume asset",
++                FormBorderStyle = FormBorderStyle.FixedDialog,
++                StartPosition = FormStartPosition.CenterParent,
++                MinimizeBox = false,
++                MaximizeBox = false,
++                ClientSize = new Size(520, 150),
++            };
++            var label = new System.Windows.Forms.Label
++            {
++                Text = "Asset name or prefix from meta; separate several with ';'. Every match and all of its\n" +
++                       "dependencies are loaded together. Example: 3d/chara/body/bdy1001_00; 3d/chara/head/chr1001_00",
++                Location = new Point(12, 12),
++                Size = new Size(496, 48),
++            };
++            var input = new System.Windows.Forms.TextBox
++            {
++                Text = initial,
++                Location = new Point(12, 68),
++                Size = new Size(496, 27),
++            };
++            var ok = new System.Windows.Forms.Button { Text = "Load", DialogResult = DialogResult.OK, Location = new Point(352, 108), Size = new Size(75, 30) };
++            var cancel = new System.Windows.Forms.Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(433, 108), Size = new Size(75, 30) };
++            form.Controls.AddRange(new Control[] { label, input, ok, cancel });
++            form.AcceptButton = ok;
++            form.CancelButton = cancel;
++
++            return form.ShowDialog(this) == DialogResult.OK ? input.Text : null;
++        }
++    }
++}
+diff --git a/AnimeStudio.GUI/MainForm.cs b/AnimeStudio.GUI/MainForm.cs
+index ef7fdf0..1e4c86a 100644
+--- a/AnimeStudio.GUI/MainForm.cs
++++ b/AnimeStudio.GUI/MainForm.cs
+@@ -100,6 +100,7 @@ namespace AnimeStudio.GUI
+             InitializeProgressBar();
+             InitializeLogger();
+             InitalizeOptions();
++            InitializeUmaMusume();
+             FMODinit();
+         }
+ 
+diff --git a/AnimeStudio/AnimeStudio.csproj b/AnimeStudio/AnimeStudio.csproj
+index 8d476f2..d3e1c60 100644
+--- a/AnimeStudio/AnimeStudio.csproj
++++ b/AnimeStudio/AnimeStudio.csproj
+@@ -34,6 +34,11 @@
+ 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+ 			<TargetPath>AnimeStudio.FBXNative.dll</TargetPath>
+ 		</ContentWithTargetPath>
++		<!-- Uma Musume: SQLite3 Multiple Ciphers, needed to read the encrypted "meta" database. Optional at build time. -->
++		<ContentWithTargetPath Include="..\AnimeStudio.Libraries\sqlite3mc_x64.dll" Condition="Exists('..\AnimeStudio.Libraries\sqlite3mc_x64.dll')">
++			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
++			<TargetPath>sqlite3mc_x64.dll</TargetPath>
++		</ContentWithTargetPath>
+ 	</ItemGroup>
+ 
+ </Project>
+diff --git a/AnimeStudio/FileReader.cs b/AnimeStudio/FileReader.cs
+index eb75cfa..371b914 100644
+--- a/AnimeStudio/FileReader.cs
++++ b/AnimeStudio/FileReader.cs
+@@ -247,6 +247,9 @@ namespace AnimeStudio
+                     case GameType.SchoolGirlStrikers:
+                         reader = DecryptSchoolGirlStrikers(reader);
+                         break;
++                    case GameType.UmaMusume:
++                        reader = DecryptUmaMusume(reader);
++                        break;
+                 }
+             }
+             if (reader.FileType == FileType.BundleFile && game.Type.IsBlockFile() || reader.FileType == FileType.ENCRFile || reader.FileType == FileType.Blb2File || reader.FileType == FileType.Blb3File || reader.FileType == FileType.HygFile || reader.FileType == FileType.VFSFile || game.Type.IsAzurPromiliaCBT2())
+diff --git a/AnimeStudio/GameManager.cs b/AnimeStudio/GameManager.cs
+index d2f0e7a..8f05a25 100644
+--- a/AnimeStudio/GameManager.cs
++++ b/AnimeStudio/GameManager.cs
+@@ -90,6 +90,7 @@ namespace AnimeStudio
+ 
+             Games.Add(index++, new UnityCNGame(GameType.UnityCNCustomKey, new("UnityCN Custom Key", ""), GameCategory.Unity));
+             Games.Add(index++, new Game(GameType.AFKJourney, "AFK Journey"));
++            Games.Add(index++, new Game(GameType.UmaMusume, "Uma Musume (JP)"));
+         }
+         public static Game GetGameByType(GameType gameType) => Games.FirstOrDefault(x => x.Value.Type == gameType).Value;
+         public static Game GetGame(GameType gameType) => GetGameByType(gameType);
+@@ -264,6 +265,7 @@ namespace AnimeStudio
+         RewindingCadence,
+         AzurPromiliaCBT2,
+         AFKJourney,
++        UmaMusume,
+     }
+ 
+ 
+@@ -278,6 +280,7 @@ namespace AnimeStudio
+     public static class GameTypes
+     {
+         public static bool IsNormal(this GameType type) => type == GameType.Normal;
++        public static bool IsUmaMusume(this GameType type) => type == GameType.UmaMusume;
+         public static bool IsUnityCN(this Game game) => game is UnityCNGame || game.Type == GameType.UnityCN;
+         public static bool IsGI(this GameType type) => type == GameType.GI;
+         public static bool IsGIPack(this GameType type) => type == GameType.GI_Pack;
+diff --git a/AnimeStudio/ImportHelper.cs b/AnimeStudio/ImportHelper.cs
+index 496293d..281cc96 100644
+--- a/AnimeStudio/ImportHelper.cs
++++ b/AnimeStudio/ImportHelper.cs
+@@ -1124,5 +1124,41 @@ namespace AnimeStudio
+             ms.Position = 0;
+             return new FileReader(reader.FullPath, ms);
+         }
++
++        public static FileReader DecryptUmaMusume(FileReader reader)
++        {
++            Logger.Verbose($"Attempting to decrypt file {reader.FileName} with Uma Musume encryption");
++
++            UmaMetaEntry entry;
++            try
++            {
++                entry = UmaMeta.FindByFile(reader.FullPath);
++            }
++            catch (Exception e)
++            {
++                Logger.Error($"[UmaMusume] Failed to load meta database for {reader.FileName}", e);
++                reader.Position = 0;
++                return reader;
++            }
++
++            if (entry == null || !entry.IsEncrypted)
++            {
++                Logger.Verbose(entry == null ? $"{reader.FileName} is not listed in meta, loading as is" : $"{entry.Name} is not encrypted");
++                reader.Position = 0;
++                return reader;
++            }
++
++            reader.Position = 0;
++            var data = reader.ReadBytes((int)reader.Remaining);
++            UmaCrypto.Apply(data, UmaCrypto.BuildKeystream(UmaKeys.Current.ABKeyBytes, entry.Key));
++
++            Logger.Verbose($"Decrypted Uma Musume file {entry.Name} successfully !!");
++
++            MemoryStream ms = new();
++            ms.Write(data);
++            ms.Position = 0;
++            reader.Dispose();
++            return new FileReader(reader.FullPath, ms);
++        }
+     }
+ }
+diff --git a/AnimeStudio/UmaMusume/README.md b/AnimeStudio/UmaMusume/README.md
+new file mode 100644
+index 0000000..ebe5778
+--- /dev/null
++++ b/AnimeStudio/UmaMusume/README.md
+@@ -0,0 +1,33 @@
++# Uma Musume (JP) support
++
++Opens Uma Musume: Pretty Derby (JP, DMM/Steam) asset bundles so they load and export like any other Unity game.
++
++## How it works
++
++- `meta` (the game's asset database) is read with SQLite3 Multiple Ciphers (ChaCha20). It maps each
++  hash-named file in `dat/` to its asset name, dependencies and a per-file key.
++- Bundles are XOR-encrypted from offset 256 with a keystream built from the AB key and the per-file key
++  (`UmaCrypto`). Files with key 0 are loaded as-is.
++- The game folder is the one holding both `meta` and `dat`. It is found by walking up from a loaded file.
++
++## Setup
++
++1. Put `sqlite3mc_x64.dll` (Windows x64 build of SQLite3 Multiple Ciphers) in `AnimeStudio.Libraries/`
++   before building, or next to `AnimeStudio.GUI.exe` afterwards.
++2. Keys live in `UmaKeys.json` next to the executable (created with defaults on first use). Edit it if the
++   game changes keys; no rebuild needed.
++
++## Use
++
++1. Game selector: **Uma Musume (JP)**.
++2. **File > Load Uma Musume asset...**, pick the data folder (default
++   `%USERPROFILE%\AppData\LocalLow\Cygames\umamusume`), then enter one or more asset name prefixes separated
++   by `;`, e.g. `3d/chara/body/bdy1001_00; 3d/chara/head/chr1001_00`. Matches and all their dependencies
++   are loaded together.
++3. Export as usual (FBX via Animator, Texture2D, Material, AnimationClip).
++
++Loading hash-named files from `dat/` directly with Load file / Load folder also decrypts them.
++
++## Credits
++
++Encryption scheme and keys as implemented by UmaViewer (https://github.com/katboi01/UmaViewer).
+diff --git a/AnimeStudio/UmaMusume/UmaCrypto.cs b/AnimeStudio/UmaMusume/UmaCrypto.cs
+new file mode 100644
+index 0000000..7839add
+--- /dev/null
++++ b/AnimeStudio/UmaMusume/UmaCrypto.cs
+@@ -0,0 +1,68 @@
++using System;
++
++namespace AnimeStudio
++{
++    /// <summary>
++    /// Uma Musume asset bundle encryption, reimplemented from the scheme UmaViewer uses
++    /// (UmaDatabaseEntry.FKey + UmaAssetBundleStream).
++    ///
++    /// keystream[i * 8 + j] = abKey[i] ^ fileKeyLE[j]     (length = abKey.Length * 8)
++    /// data[p] ^= keystream[p % keystream.Length]          for every absolute offset p >= 256
++    /// The first 256 bytes are stored in the clear, so the UnityFS header stays readable.
++    /// </summary>
++    public static class UmaCrypto
++    {
++        public const int HeaderSize = 256;
++        public const int DBBaseKeyLength = 13;
++
++        public static byte[] BuildKeystream(byte[] abKey, long fileKey)
++        {
++            if (abKey == null || abKey.Length == 0)
++            {
++                throw new ArgumentException("AB key is empty", nameof(abKey));
++            }
++
++            var keyBytes = BitConverter.GetBytes(fileKey);
++            if (!BitConverter.IsLittleEndian)
++            {
++                Array.Reverse(keyBytes);
++            }
++
++            var keystream = new byte[abKey.Length * 8];
++            for (int i = 0; i < abKey.Length; i++)
++            {
++                for (int j = 0; j < 8; j++)
++                {
++                    keystream[(i << 3) + j] = (byte)(abKey[i] ^ keyBytes[j]);
++                }
++            }
++            return keystream;
++        }
++
++        /// <summary> XOR is symmetric, so this both encrypts and decrypts. <paramref name="data"/> must start at file offset 0. </summary>
++        public static void Apply(byte[] data, byte[] keystream)
++        {
++            int len = keystream.Length;
++            for (int p = HeaderSize; p < data.Length; p++)
++            {
++                data[p] ^= keystream[p % len];
++            }
++        }
++
++        /// <summary> Final key for the encrypted meta database: dbKey[i] ^ baseKey[i % 13]. </summary>
++        public static byte[] FinalDbKey(byte[] dbKey, byte[] baseKey)
++        {
++            if (baseKey == null || baseKey.Length < DBBaseKeyLength)
++            {
++                throw new ArgumentException($"DB base key must be at least {DBBaseKeyLength} bytes", nameof(baseKey));
++            }
++
++            var key = (byte[])dbKey.Clone();
++            for (int i = 0; i < key.Length; i++)
++            {
++                key[i] ^= baseKey[i % DBBaseKeyLength];
++            }
++            return key;
++        }
++    }
++}
+diff --git a/AnimeStudio/UmaMusume/UmaKeys.cs b/AnimeStudio/UmaMusume/UmaKeys.cs
+new file mode 100644
+index 0000000..9fbc422
+--- /dev/null
++++ b/AnimeStudio/UmaMusume/UmaKeys.cs
+@@ -0,0 +1,103 @@
++using System;
++using System.IO;
++using System.Text.Json;
++
++namespace AnimeStudio
++{
++    /// <summary>
++    /// Keys for Uma Musume (JP), loaded from UmaKeys.json next to the executable so they can be
++    /// updated without rebuilding. Missing or broken file -> defaults are written back.
++    /// Key values originate from UmaViewer (https://github.com/katboi01/UmaViewer).
++    /// </summary>
++    public sealed class UmaKeys
++    {
++        public const string FileName = "UmaKeys.json";
++
++        /// <summary> Base key for asset bundles (hex). </summary>
++        public string ABKey { get; set; }
++        /// <summary> Key for the JP "meta" database before it is combined with DBBaseKey (hex). </summary>
++        public string DBKey { get; set; }
++        /// <summary> Base key XORed into DBKey (hex, at least 13 bytes). </summary>
++        public string DBBaseKey { get; set; }
++
++        public static UmaKeys Defaults() => new UmaKeys
++        {
++            ABKey = "532B4631E4A7B9473E7CFB",
++            DBKey = "6D5B65336336632554712D73505363386D34377B356370233734532973433633",
++            DBBaseKey = "F170CEA4DFCEA3E1A5D8C70BD1",
++        };
++
++        private static readonly object Sync = new object();
++        private static UmaKeys current;
++
++        public static UmaKeys Current
++        {
++            get
++            {
++                lock (Sync)
++                {
++                    return current ??= Load();
++                }
++            }
++        }
++
++        /// <summary> Forces UmaKeys.json to be read again on next use. </summary>
++        public static void Reload()
++        {
++            lock (Sync)
++            {
++                current = null;
++            }
++        }
++
++        public byte[] ABKeyBytes => FromHex(ABKey, nameof(ABKey));
++        public byte[] DBKeyBytes => FromHex(DBKey, nameof(DBKey));
++        public byte[] DBBaseKeyBytes => FromHex(DBBaseKey, nameof(DBBaseKey));
++
++        private static string FilePath => Path.Combine(AppDomain.CurrentDomain.BaseDirectory, FileName);
++
++        private static UmaKeys Load()
++        {
++            try
++            {
++                var keys = JsonSerializer.Deserialize<UmaKeys>(File.ReadAllText(FilePath));
++                if (keys == null || string.IsNullOrWhiteSpace(keys.ABKey) || string.IsNullOrWhiteSpace(keys.DBKey) || string.IsNullOrWhiteSpace(keys.DBBaseKey))
++                {
++                    throw new InvalidDataException("missing key");
++                }
++                return keys;
++            }
++            catch (Exception)
++            {
++                Logger.Warning($"[UmaMusume] Could not read {FileName}, writing default keys.");
++                var keys = Defaults();
++                try
++                {
++                    File.WriteAllText(FilePath, JsonSerializer.Serialize(keys, new JsonSerializerOptions { WriteIndented = true }));
++                }
++                catch (Exception e)
++                {
++                    Logger.Warning($"[UmaMusume] Could not write {FileName}: {e.Message}");
++                }
++                return keys;
++            }
++        }
++
++        private static byte[] FromHex(string hex, string name)
++        {
++            hex = (hex ?? string.Empty).Replace(" ", string.Empty).Replace("-", string.Empty);
++            if (hex.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
++            {
++                hex = hex.Substring(2);
++            }
++            try
++            {
++                return Convert.FromHexString(hex);
++            }
++            catch (FormatException)
++            {
++                throw new InvalidDataException($"[UmaMusume] {name} in {FileName} is not valid hex.");
++            }
++        }
++    }
++}
+diff --git a/AnimeStudio/UmaMusume/UmaMeta.cs b/AnimeStudio/UmaMusume/UmaMeta.cs
+new file mode 100644
+index 0000000..27d0c4d
+--- /dev/null
++++ b/AnimeStudio/UmaMusume/UmaMeta.cs
+@@ -0,0 +1,245 @@
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++
++namespace AnimeStudio
++{
++    public sealed class UmaMetaEntry
++    {
++        /// <summary> Column m: asset category (e.g. "3d", "chara"). </summary>
++        public string Type;
++        /// <summary> Column n: logical asset name (e.g. "3d/chara/body/bdy1001_00/pfb_bdy1001_00"). </summary>
++        public string Name;
++        /// <summary> Column h: physical file name under dat/&lt;first 2 chars&gt;/. </summary>
++        public string Hash;
++        /// <summary> Column d: ';'-separated names this asset depends on. </summary>
++        public string Dependencies;
++        /// <summary> Column e: per-file key, 0 when the file is not encrypted. </summary>
++        public long Key;
++
++        public bool IsEncrypted => Key != 0;
++
++        public string GetFilePath(string root) => Path.Combine(root, "dat", Hash.Substring(0, 2), Hash);
++    }
++
++    /// <summary>
++    /// Index of Uma Musume's "meta" database (JP). The game folder is the one that holds both
++    /// the "meta" file and the "dat" folder; it is found by walking up from any loaded file.
++    /// </summary>
++    public static class UmaMeta
++    {
++        private static readonly object Sync = new object();
++        private static string loadedRoot;
++        private static Dictionary<string, UmaMetaEntry> byHash = new Dictionary<string, UmaMetaEntry>(StringComparer.OrdinalIgnoreCase);
++        private static Dictionary<string, UmaMetaEntry> byName = new Dictionary<string, UmaMetaEntry>(StringComparer.Ordinal);
++        private static readonly HashSet<string> warnedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++
++        public static string LoadedRoot
++        {
++            get { lock (Sync) return loadedRoot; }
++        }
++
++        /// <summary> Walks up from <paramref name="path"/> to the folder containing both "meta" and "dat". </summary>
++        public static string FindRoot(string path)
++        {
++            if (string.IsNullOrEmpty(path))
++            {
++                return null;
++            }
++
++            var dir = Directory.Exists(path) ? path : Path.GetDirectoryName(Path.GetFullPath(path));
++            while (!string.IsNullOrEmpty(dir))
++            {
++                if (File.Exists(Path.Combine(dir, "meta")) && Directory.Exists(Path.Combine(dir, "dat")))
++                {
++                    return dir;
++                }
++                dir = Path.GetDirectoryName(dir);
++            }
++            return null;
++        }
++
++        /// <summary> Meta entry for a physical file, loading the meta database of its game folder if needed. </summary>
++        public static UmaMetaEntry FindByFile(string fullPath)
++        {
++            var root = FindRoot(fullPath);
++            if (root == null)
++            {
++                var dir = Path.GetDirectoryName(Path.GetFullPath(fullPath)) ?? string.Empty;
++                lock (Sync)
++                {
++                    if (warnedDirs.Add(dir))
++                    {
++                        Logger.Warning($"[UmaMusume] No game folder (with \"meta\" and \"dat\") found above {dir}; files there are loaded without decryption.");
++                    }
++                }
++                return null;
++            }
++
++            lock (Sync)
++            {
++                EnsureLoadedLocked(root);
++                byHash.TryGetValue(Path.GetFileName(fullPath), out var entry);
++                return entry;
++            }
++        }
++
++        /// <summary> Loads (or reuses) the meta index of a game folder. </summary>
++        public static void EnsureLoaded(string root)
++        {
++            lock (Sync)
++            {
++                EnsureLoadedLocked(root);
++            }
++        }
++
++        /// <summary>
++        /// Physical files for every asset whose name starts with <paramref name="namePrefix"/>, plus all of
++        /// their dependencies (recursively). Files missing on disk (not downloaded) are reported in <paramref name="missing"/>.
++        /// </summary>
++        public static List<string> ResolveFiles(string root, string namePrefix, out List<string> missing)
++        {
++            var result = new List<string>();
++            missing = new List<string>();
++            namePrefix = (namePrefix ?? string.Empty).Trim().Replace('\\', '/');
++            if (namePrefix.Length == 0)
++            {
++                return result;
++            }
++
++            lock (Sync)
++            {
++                EnsureLoadedLocked(root);
++
++                var visited = new HashSet<string>(StringComparer.Ordinal);
++                var queue = new Queue<string>(byName.Keys.Where(n => n.StartsWith(namePrefix, StringComparison.Ordinal)).OrderBy(n => n, StringComparer.Ordinal));
++                while (queue.Count > 0)
++                {
++                    var name = queue.Dequeue();
++                    if (!visited.Add(name) || !byName.TryGetValue(name, out var entry))
++                    {
++                        continue;
++                    }
++
++                    var path = entry.GetFilePath(root);
++                    if (File.Exists(path))
++                    {
++                        result.Add(path);
++                    }
++                    else
++                    {
++                        missing.Add(name);
++                    }
++
++                    if (!string.IsNullOrEmpty(entry.Dependencies))
++                    {
++                        foreach (var dep in entry.Dependencies.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
++                        {
++                            if (!visited.Contains(dep))
++                            {
++                                queue.Enqueue(dep);
++                            }
++                        }
++                    }
++                }
++            }
++            return result;
++        }
++
++        private static void EnsureLoadedLocked(string root)
++        {
++            root = Path.GetFullPath(root);
++            if (string.Equals(root, loadedRoot, StringComparison.OrdinalIgnoreCase))
++            {
++                return;
++            }
++
++            var entries = ReadMeta(Path.Combine(root, "meta"), UmaKeys.Current);
++
++            var newByHash = new Dictionary<string, UmaMetaEntry>(StringComparer.OrdinalIgnoreCase);
++            var newByName = new Dictionary<string, UmaMetaEntry>(StringComparer.Ordinal);
++            foreach (var e in entries)
++            {
++                newByHash.TryAdd(e.Hash, e);
++                newByName.TryAdd(e.Name, e);
++            }
++
++            byHash = newByHash;
++            byName = newByName;
++            loadedRoot = root;
++            Logger.Info($"[UmaMusume] Loaded meta from {root}: {entries.Count} entries, {entries.Count(x => x.IsEncrypted)} encrypted.");
++        }
++
++        /// <summary> Reads every row of table "a". Tries the file as plain SQLite first, then as ChaCha20-encrypted with the JP key. </summary>
++        public static List<UmaMetaEntry> ReadMeta(string metaPath, UmaKeys keys)
++        {
++            if (!File.Exists(metaPath))
++            {
++                throw new FileNotFoundException("[UmaMusume] meta database not found", metaPath);
++            }
++
++            Exception plainError;
++            try
++            {
++                return ReadMetaWithKey(metaPath, null);
++            }
++            catch (Exception e)
++            {
++                plainError = e;
++            }
++
++            Logger.Verbose($"[UmaMusume] meta is not plain SQLite ({plainError.Message}), trying encrypted.");
++            var finalKey = UmaCrypto.FinalDbKey(keys.DBKeyBytes, keys.DBBaseKeyBytes);
++            try
++            {
++                return ReadMetaWithKey(metaPath, finalKey);
++            }
++            catch (Exception e)
++            {
++                throw new InvalidDataException($"[UmaMusume] Could not open meta at {metaPath}. Check DBKey/DBBaseKey in {UmaKeys.FileName}. ({e.Message})", e);
++            }
++        }
++
++        private static List<UmaMetaEntry> ReadMetaWithKey(string metaPath, byte[] key)
++        {
++            var db = UmaSqlite3MC.OpenReadOnly(metaPath);
++            try
++            {
++                if (key != null)
++                {
++                    UmaSqlite3MC.SetKey(db, UmaSqlite3MC.CIPHER_CHACHA20, key);
++                }
++
++                bool hasKeyColumn = false;
++                UmaSqlite3MC.ForEachRow(db, "SELECT name FROM pragma_table_info('a') WHERE name = 'e'", _ => hasKeyColumn = true);
++
++                var sql = hasKeyColumn ? "SELECT m,n,h,d,e FROM a" : "SELECT m,n,h,d FROM a";
++                var list = new List<UmaMetaEntry>();
++                UmaSqlite3MC.ForEachRow(db, sql, stmt =>
++                {
++                    var name = UmaSqlite3MC.ColumnText(stmt, 1);
++                    var hash = UmaSqlite3MC.ColumnText(stmt, 2);
++                    if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(hash) || hash.Length < 2)
++                    {
++                        return;
++                    }
++
++                    list.Add(new UmaMetaEntry
++                    {
++                        Type = UmaSqlite3MC.ColumnText(stmt, 0),
++                        Name = name,
++                        Hash = hash,
++                        Dependencies = UmaSqlite3MC.ColumnText(stmt, 3),
++                        Key = hasKeyColumn ? UmaSqlite3MC.ColumnInt64(stmt, 4) : 0L,
++                    });
++                });
++                return list;
++            }
++            finally
++            {
++                UmaSqlite3MC.Close(db);
++            }
++        }
++    }
++}
+diff --git a/AnimeStudio/UmaMusume/UmaSqlite3MC.cs b/AnimeStudio/UmaMusume/UmaSqlite3MC.cs
+new file mode 100644
+index 0000000..eb0d312
+--- /dev/null
++++ b/AnimeStudio/UmaMusume/UmaSqlite3MC.cs
+@@ -0,0 +1,151 @@
++using System;
++using System.Runtime.InteropServices;
++using System.Text;
++
++namespace AnimeStudio
++{
++    /// <summary>
++    /// Minimal P/Invoke surface for SQLite3 Multiple Ciphers (https://github.com/utelle/SQLite3MultipleCiphers).
++    /// Only what is needed to read Uma Musume's encrypted "meta" database.
++    /// The native library (sqlite3mc_x64.dll on Windows) must sit next to the executable.
++    /// </summary>
++    internal static class UmaSqlite3MC
++    {
++        private const string Dll = "sqlite3mc_x64";
++
++        public const int SQLITE_OK = 0;
++        public const int SQLITE_ROW = 100;
++        public const int SQLITE_DONE = 101;
++        public const int SQLITE_OPEN_READONLY = 0x00000001;
++
++        /// <summary> sqlite3mc cipher id for ChaCha20-Poly1305 (sqleet). </summary>
++        public const int CIPHER_CHACHA20 = 3;
++
++        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_open_v2")]
++        private static extern int sqlite3_open_v2(byte[] filename, out IntPtr db, int flags, IntPtr vfs);
++
++        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_close_v2")]
++        private static extern int sqlite3_close_v2(IntPtr db);
++
++        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_errmsg")]
++        private static extern IntPtr sqlite3_errmsg(IntPtr db);
++
++        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3mc_config")]
++        private static extern int sqlite3mc_config(IntPtr db, byte[] paramName, int newValue);
++
++        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_key")]
++        private static extern int sqlite3_key(IntPtr db, byte[] key, int keyLength);
++
++        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_prepare_v2")]
++        private static extern int sqlite3_prepare_v2(IntPtr db, byte[] sql, int nByte, out IntPtr stmt, IntPtr tail);
++
++        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_step")]
++        private static extern int sqlite3_step(IntPtr stmt);
++
++        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_finalize")]
++        private static extern int sqlite3_finalize(IntPtr stmt);
++
++        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_column_text")]
++        private static extern IntPtr sqlite3_column_text(IntPtr stmt, int col);
++
++        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_column_bytes")]
++        private static extern int sqlite3_column_bytes(IntPtr stmt, int col);
++
++        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_column_int64")]
++        private static extern long sqlite3_column_int64(IntPtr stmt, int col);
++
++        private static byte[] Utf8Z(string s)
++        {
++            var bytes = Encoding.UTF8.GetBytes(s);
++            var z = new byte[bytes.Length + 1];
++            Buffer.BlockCopy(bytes, 0, z, 0, bytes.Length);
++            return z;
++        }
++
++        public static IntPtr OpenReadOnly(string path)
++        {
++            int rc = sqlite3_open_v2(Utf8Z(path), out var db, SQLITE_OPEN_READONLY, IntPtr.Zero);
++            if (rc != SQLITE_OK)
++            {
++                string msg = db != IntPtr.Zero ? ErrMsg(db) : "unknown error";
++                Close(db);
++                throw new InvalidOperationException($"sqlite3_open_v2 failed (rc={rc}): {msg}");
++            }
++            return db;
++        }
++
++        public static void Close(IntPtr db)
++        {
++            if (db != IntPtr.Zero)
++            {
++                sqlite3_close_v2(db);
++            }
++        }
++
++        public static string ErrMsg(IntPtr db) => Marshal.PtrToStringUTF8(sqlite3_errmsg(db)) ?? string.Empty;
++
++        /// <summary> Selects the cipher, then applies the raw key bytes (same calls UmaViewer makes). </summary>
++        public static void SetKey(IntPtr db, int cipher, byte[] key)
++        {
++            // sqlite3mc_config returns the parameter's value on success, or -1 on failure.
++            int cfg = sqlite3mc_config(db, Utf8Z("cipher"), cipher);
++            if (cfg < 0)
++            {
++                throw new InvalidOperationException($"sqlite3mc_config(cipher={cipher}) failed: {ErrMsg(db)}");
++            }
++
++            int rc = sqlite3_key(db, key, key.Length);
++            if (rc != SQLITE_OK)
++            {
++                throw new InvalidOperationException($"sqlite3_key failed (rc={rc}): {ErrMsg(db)}");
++            }
++        }
++
++        /// <summary> Runs a query and calls <paramref name="onRow"/> for every row. </summary>
++        public static void ForEachRow(IntPtr db, string sql, Action<IntPtr> onRow)
++        {
++            int rc = sqlite3_prepare_v2(db, Utf8Z(sql), -1, out var stmt, IntPtr.Zero);
++            if (rc != SQLITE_OK)
++            {
++                throw new InvalidOperationException($"sqlite3_prepare_v2 failed (rc={rc}): {ErrMsg(db)}");
++            }
++
++            try
++            {
++                while (true)
++                {
++                    rc = sqlite3_step(stmt);
++                    if (rc == SQLITE_ROW)
++                    {
++                        onRow(stmt);
++                    }
++                    else if (rc == SQLITE_DONE)
++                    {
++                        break;
++                    }
++                    else
++                    {
++                        throw new InvalidOperationException($"sqlite3_step failed (rc={rc}): {ErrMsg(db)}");
++                    }
++                }
++            }
++            finally
++            {
++                sqlite3_finalize(stmt);
++            }
++        }
++
++        public static string ColumnText(IntPtr stmt, int col)
++        {
++            var ptr = sqlite3_column_text(stmt, col);
++            if (ptr == IntPtr.Zero)
++            {
++                return null;
++            }
++            int len = sqlite3_column_bytes(stmt, col);
++            return Marshal.PtrToStringUTF8(ptr, len);
++        }
++
++        public static long ColumnInt64(IntPtr stmt, int col) => sqlite3_column_int64(stmt, col);
++    }
++}
+-- 
+2.43.0
+
