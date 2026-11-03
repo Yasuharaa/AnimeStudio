@@ -301,11 +301,32 @@ namespace AnimeStudio
             iMesh.hasNormal = mesh.m_Normals?.Length > 0;
             iMesh.hasUV = new bool[8];
             iMesh.uvType = new int[8];
+            var uvDim = new int[8];
             for (int uv = 0; uv < 8; uv++)
             {
                 var key = $"UV{uv}";
-                iMesh.hasUV[uv] = mesh.GetUV(uv)?.Length > 0 && options.uvs[key].Item1;
+                var data = mesh.GetUV(uv);
+                uvDim[uv] = data?.Length > 0 ? data.Length / (int)mesh.m_VertexCount : 0;
+                iMesh.hasUV[uv] = uvDim[uv] > 0 && options.uvs[key].Item1;
                 iMesh.uvType[uv] = options.uvs[key].Item2;
+                if (uvDim[uv] > 0)
+                    Logger.Info($"[{mesh.m_Name}] UV{uv}: {uvDim[uv]} components");
+            }
+            
+            // Route .zw of 4-component channels into the next free contiguous slots.
+            // zwSource[slot] = source channel whose zw is written into that slot, -1 = none.
+            var zwSource = Enumerable.Repeat(-1, 8).ToArray();
+            int nextFree = Array.LastIndexOf(iMesh.hasUV, true) + 1;
+            for (int uv = 0; uv < 8 && nextFree < 8; uv++)
+            {
+                if (iMesh.hasUV[uv] && zwSource[uv] < 0 && uvDim[uv] == 4)
+                {
+                    zwSource[nextFree] = uv;
+                    iMesh.hasUV[nextFree] = true;
+                    iMesh.uvType[nextFree] = iMesh.uvType[uv];
+                    Logger.Info($"[{mesh.m_Name}] UV{uv}.zw -> UV slot {nextFree}");
+                    nextFree++;
+                }
             }
             iMesh.hasTangent = mesh.m_Tangents != null && mesh.m_Tangents.Length == mesh.m_VertexCount * 4;
             iMesh.hasColor = mesh.m_Colors?.Length > 0;
@@ -379,19 +400,20 @@ namespace AnimeStudio
                 iVertex.UV = new float[8][];
                 for (int uv = 0; uv < 8; uv++)
                 {
-                    if (iMesh.hasUV[uv])
+                    if (!iMesh.hasUV[uv])
+                        continue;
+                
+                    if (zwSource[uv] >= 0)
                     {
-                        c = 4;
+                        // Packed slot: read zw from the source 4-component channel
+                        var src = mesh.GetUV(zwSource[uv]);
+                        iVertex.UV[uv] = new[] { src[j * 4 + 2], src[j * 4 + 3] };
+                    }
+                    else
+                    {
                         var m_UV = mesh.GetUV(uv);
-                        if (m_UV.Length == mesh.m_VertexCount * 2)
-                        {
-                            c = 2;
-                        }
-                        else if (m_UV.Length == mesh.m_VertexCount * 3)
-                        {
-                            c = 3;
-                        }
-                        iVertex.UV[uv] = new[] { m_UV[j * c], m_UV[j * c + 1] };
+                        var dim = uvDim[uv];
+                        iVertex.UV[uv] = new[] { m_UV[j * dim], m_UV[j * dim + 1] };
                     }
                 }
                 //Tangent
